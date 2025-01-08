@@ -16,36 +16,48 @@ def sair(conexao):
 def dados_recebidos(conexao, dados):
     if dados == b'':
         return sair(conexao)
-    print(conexao, dados)
-    #Teste 1
-    def dados_recebidos(conexao, dados):
-    if dados == b'':
-    parts = dados.split(b' ')
-    if  parts[0] == b'PING':
-        conexao.enviar(b':server PONG server :' + dados.split(b' ',1)[1])
-    elif parts[0] == b'NICK':
-        print(b"oi")
-        nick = parts[1]
-        if not(validar_nome(nick)):
-            conexao.enviar(b':server 432 * %s :Erroneous nickname\r\n' % nick)
+    padrao = b'(?<=\r\n)'
+    dados = [substring for substring in re.split(padrao, dados)]
+
+    for dado in dados: 
+        #teste 2
+        if dado.endswith(b'\r\n'): 
+            dado = conexao.residuais + dado
+            
+            #teste 1
+            if dado.startswith(b'PING'):
+               dado = dado.replace(b'PING ', b'')
+               conexao.enviar(b':server PONG server :' + dado)
+            #teste 3
+            elif dado.startswith(b'NICK'):
+                nick =  dado.replace(b'NICK ', b'').replace(b'\r\n', b'')
+                if not(validar_nome(nick)):
+                    conexao.enviar(b':server 432 * %s :Erroneous nickname\r\n' % nick)
+                else:
+                    conexao.enviar(b':server 001 %s :Welcome\r\n' % nick)
+                    conexao.enviar(b':server 422 %s :MOTD File is missing\r\n' % nick)
+            else:
+                return sair(conexao)
+
+            print(conexao, dado)    
+            conexao.residuais = b''
+            
         else:
-            conexao.enviar(b':server 001 %s :Welcome\r\n' % nick)
-            conexao.enviar(b':server 422 %s :MOTD File is missing\r\n' % nick)
-    else:
-        return sair(conexao)
-    print(conexao, dados)
+            conexao.residuais += dado
 
-    
-
-def conexao_aceita(conexao):
-    print(conexao, 'nova conexão')
-        return conexao.enviar(msg)
+    if conexao.residuais.endswith(b'\r\n'):
+        conexao.enviar(b':server PONG server :' + conexao.residuais.replace(b'PING ', b''))
+        conexao.residuais = b''
+        
+        print(conexao, d)
 
 def conexao_aceita(conexao):
+    conexao.residuais = b''
+    conexao.apelidos = b'' 
     print(conexao, 'nova conexão')
     conexao.registrar_recebedor(dados_recebidos)
 
-
+apelidos = {}
 servidor = Servidor(6667)
 servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
 asyncio.get_event_loop().run_forever()
