@@ -2,95 +2,229 @@
 import asyncio
 from grader.tcp import Servidor
 import re
+from platform import system
+import gc
+
+def log(msg, *args, **kwargs):
+    print('[LOG]::', msg, *args, **kwargs)
+    pass
+
+
+MSG_TERMINATOR = b'\r\n'
+
+CONNS_TABLE = {}  
+USERS_TO_ID_TABLE = {}  
+CHANNEL_NAME_TO_USER_LST_TABLE = {} 
+
+
+def get_object_by_id(id_):
+    for item in gc.get_objects():
+        if id(item) == id_:
+            return item
 
 
 def validar_nome(nome):
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
+def msg(message):
+    msg_bytes = bytes(message, 'utf-8') + MSG_TERMINATOR
+    log(f'[MSG CREATED]{msg_bytes}')
+    return msg_bytes
 
-def sair(conexao):
-    print(conexao, 'conexão fechada')
-    conexao.fechar()
+
+def get_nick_from_conn(conn):
+    try:
+        for nickname, conn_id in USERS_TO_ID_TABLE.items():
+            if conn_id == id(conn):
+                return nickname
+    except:
+        return '*'
+
+
+def get_full_msg_no_terminator(connection, data_received):
+    data = data_received.split(b'\n')
+    messages_data = []
+    for i, item in enumerate(data):
+        if i == len(data) - 1:
+            messages_data.append(item)
+        else:
+            messages_data.append(item + b'\n')
+
+    if not messages_data[-1]:
+        messages_data = messages_data[:-1]
+
+    messages = []
+
+    for message_data in messages_data:
+        if id(connection) not in CONNS_TABLE:
+            CONNS_TABLE[id(connection)] = b''
+
+        CONNS_TABLE[id(connection)] += message_data
+
+        if message_data.endswith(b'\n'):
+            messages.append((connection, CONNS_TABLE[id(connection)]))
+            del CONNS_TABLE[id(connection)]
+
+    for i, msg in enumerate(messages):
+        messages[i] = (msg[0], msg[1][:-2])
+
+    return messages
+
+def sair(connection):
+    log(connection, 'conexão fechada')
+    current_user = get_nick_from_conn(connection)
+    for channel_name, user_list in CHANNEL_NAME_TO_USER_LST_TABLE.items():
+        if current_user in user_list:
+            for user in user_list:
+                if user != current_user:
+                    get_object_by_id(USERS_TO_ID_TABLE[user]).enviar(msg(f':{current_user} QUIT :Connection closed'))
+            CHANNEL_NAME_TO_USER_LST_TABLE[channel_name].remove(current_user)
+
+    del USERS_TO_ID_TABLE[current_user]
+    connection.fechar()
 
 
 def dados_recebidos(conexao, dados):
+    log('[OBJ RCV]', conexao, dados)
+
     if dados == b'':
         return sair(conexao)
-    padrao = b'(?<=\r\n)'
-    dados = [substring for substring in re.split(padrao, dados)]
 
-    for dado in dados: 
-        #teste 2
-        if dado.endswith(b'\r\n'): 
-            dado = conexao.residuais + dado
-            
-            #teste 1
-            if dado.startswith(b'PING'):
-               dado = dado.replace(b'PING ', b'')
-               conexao.enviar(b':server PONG server :' + dado)
-            #teste 3
-            elif dado.startswith(b'NICK'):
-                nick =  dado.replace(b'NICK ', b'').replace(b'\r\n', b'')
-                if not(validar_nome(nick)):
-                    conexao.enviar(b':server 432 * %s :Erroneous nickname\r\n' % nick)
+    for msg_tuple in get_full_msg_no_terminator(conexao, dados):
+        conexao, dados = msg_tuple
+
+        try:
+            comando, carga_util = dados.split(b' ', 1)
+        except:
+            comando, carga_util = dados.split(b' ', 1)[0], None
+
+        comando = comando.upper()
+
+        if comando == b'PING':
+            conexao.enviar(msg(f':server PONG server :{carga_util.decode()}'))
+
+        if comando == b'NICK':
+            orig_carga_util = carga_util
+            carga_util = bytes(carga_util.decode("utf-8").lower(), 'utf-8')
+
+            old_nick = get_nick_from_conn(conexao)
+            if not validar_nome(carga_util):
+                if not id(conexao) in USERS_TO_ID_TABLE.values():
+                    apelido_atual = '*'
+                return conexao.enviar(msg(f':server 432 {apelido_atual} {orig_carga_util.decode("utf-8")} :Erroneous nickname'))
+
+            if carga_util.decode("utf-8") in USERS_TO_ID_TABLE:
+                log('NICK ALREADY EXISTS')
+                old_nick = get_nick_from_conn(conexao)
+                old_nick = old_nick if old_nick is not None else '*'
+                return conexao.enviar(msg(f':server 433 {old_nick} {orig_carga_util.decode("utf-8")} :Nickname is already in use'))
+
+            if old_nick in USERS_TO_ID_TABLE.keys():
+                del USERS_TO_ID_TABLE[old_nick]
+                new_nick = carga_util.decode("utf-8")
+                USERS_TO_ID_TABLE[new_nick] = id(conexao)
+
+                for channel_name, usrs_in_channel in CHANNEL_NAME_TO_USER_LST_TABLE.items():
+                    if old_nick in usrs_in_channel:
+                        CHANNEL_NAME_TO_USER_LST_TABLE[channel_name].remove(old_nick)
+                        CHANNEL_NAME_TO_USER_LST_TABLE[channel_name].append(new_nick)
+
+                return conexao.enviar(msg(f':{old_nick} NICK {new_nick}'))
+
+            USERS_TO_ID_TABLE[carga_util.decode("utf-8")] = id(conexao)
+            conexao.enviar(msg(f':server 001 {carga_util.decode("utf-8")} :Welcome'))
+            conexao.enviar(msg(f':server 422 {carga_util.decode("utf-8")} :MOTD File is missing'))
+
+        if comando == b'PRIVMSG':
+            tgt, msg_bytes = carga_util.split(b' :', 1)
+            tgt = tgt.decode("utf-8")
+            try:
+                if not tgt.startswith('#'):
+                    log('USERS_TO_ID_TABLE')
+                    log(tgt.lower())
+                    log(USERS_TO_ID_TABLE)
+
+                    tgt_conn_id = USERS_TO_ID_TABLE[tgt.lower()]
+                    get_object_by_id(tgt_conn_id).enviar(
+                        msg(f':{get_nick_from_conn(conexao)} PRIVMSG {tgt} :{msg_bytes.decode("utf-8")}')
+                    )
                 else:
-                    if nick.lower() in apelidos:
-                        if conexao.apelido != b'':
-                            conexao.enviar(b':server 433 %s %s :Nickname is already in use\r\n' % (conexao.apelido, nick))
-                        else:
-                            conexao.enviar(b':server 433 * %s :Nickname is already in use\r\n' % nick)
-                    #teste 4
-                    else:
-                        if conexao.apelido != b'':
-                            conexao.enviar(b':%s NICK %s\r\n' % (conexao.apelido, nick))
-                            del apelidos[conexao.apelido.lower()]
-                        else:
-                            conexao.enviar(b':server 001 %s :Welcome\r\n' % nick)
-                            conexao.enviar(b':server 422 %s :MOTD File is missing\r\n' % nick)
-                            
-                        apelidos[nick.lower()] = conexao
-                        conexao.apelido = nick
-            #teste 5            
-            elif dado.startswith(b'PRIVMSG'):
-                 privmsg = dado.replace(b'PRIVMSG ', b'').replace(b'\r\n', b'')
-                 destinatario, mensagem = privmsg.split(b' :', 1)
-                 origem = conexao.apelido
-                 if destinatario is not None:
-                     if destinatario.lower() in apelidos:
-                         apelidos[destinatario.lower()].enviar(b':%s PRIVMSG %s :%s\r\n' % (origem, destinatario, mensagem))
-                 if dado.startswith(b'#'):
-                      canal = dado.replace(b'#', b'')
-                      if canal in canais[canal]:
-                           for usuario in canais[canal]:
-                               if usuario != conexao:
-                                    usuario.enviar(b':%s PRIVMSG %s :%s\r\n' % (origem, b'#' + canal, mensagem))
+                    log('IS GROUP CHAT: tgt=', tgt)
+                    curr_usr = get_nick_from_conn(conexao)
 
+                    for usr in CHANNEL_NAME_TO_USER_LST_TABLE[tgt.lower()]:
+                        log('CHANNEL_NAME_TO_USER_LST_TABLE')
+                        log(tgt.lower())
+                        log(CHANNEL_NAME_TO_USER_LST_TABLE)
+
+                        tgt_conn_id = USERS_TO_ID_TABLE[usr.lower()]
+                        tgt_nick_obj = get_object_by_id(tgt_conn_id)
+
+                        log('tgt_nick=', usr)
+                        log('curr_usr=', curr_usr)
+
+                        if not tgt_nick_obj == conexao:
+                            tgt_nick_obj.enviar(msg(f':{curr_usr} PRIVMSG {tgt} :{msg_bytes.decode("utf-8")}'))
+
+            except KeyError as err:
+                log('[ERR]Key not found (tgt):', err)
+
+        if comando == b'JOIN':
+            carga_util = bytes(carga_util.decode("utf-8").lower(), 'utf-8')
+
+            if not carga_util.startswith(b'#'):
+                return conexao.enviar(msg(f':server 403 {carga_util.decode("utf-8")} :No such channel'))
+
+            channel_name = carga_util.decode("utf-8")
+
+            if channel_name not in CHANNEL_NAME_TO_USER_LST_TABLE:
+                CHANNEL_NAME_TO_USER_LST_TABLE[channel_name] = []
+
+            curr_usr = get_nick_from_conn(conexao)
+
+            if curr_usr not in CHANNEL_NAME_TO_USER_LST_TABLE[channel_name]:
+                CHANNEL_NAME_TO_USER_LST_TABLE[channel_name].append(curr_usr)
+
+            for usr in CHANNEL_NAME_TO_USER_LST_TABLE[channel_name]:
+                get_object_by_id(USERS_TO_ID_TABLE[usr]).enviar(msg(f':{curr_usr} JOIN :{channel_name}'))
+
+            channel_usrs_lst = CHANNEL_NAME_TO_USER_LST_TABLE[channel_name]
+            channel_usrs_lst.sort()
+
+            full_usr_str = " ".join(channel_usrs_lst)
+
+            n = 512 - len(f':server 353 {curr_usr} = {channel_name} :') - len(MSG_TERMINATOR)
+            chunks = [full_usr_str[i:i+n] for i in range(0, len(full_usr_str), n)]
+            conexao.enviar(msg(f':server 353 {curr_usr} = {channel_name} :{" ".join(chunks)}'))
+            return conexao.enviar(msg(f':server 366 {curr_usr} {channel_name} :End of /NAMES list.'))
+
+        if comando == b'PART':
+            carga_util = bytes(carga_util.decode("utf-8").lower(), 'utf-8')
+            channel_name = carga_util.decode("utf-8").split(' :')[0]
+
+            if not carga_util.startswith(b'#'):
+                return conexao.enviar(msg(f':server 403 {channel_name} :No such channel'))
+
+            curr_usr = get_nick_from_conn(conexao)
+
+            if channel_name in CHANNEL_NAME_TO_USER_LST_TABLE and curr_usr in CHANNEL_NAME_TO_USER_LST_TABLE[channel_name]:
+                CHANNEL_NAME_TO_USER_LST_TABLE[channel_name].remove(curr_usr)
+                for usr in CHANNEL_NAME_TO_USER_LST_TABLE[channel_name]:
+                    get_object_by_id(USERS_TO_ID_TABLE[usr]).enviar(msg(f':{curr_usr} PART {channel_name}'))
+
+                if not CHANNEL_NAME_TO_USER_LST_TABLE[channel_name]:
+                    del CHANNEL_NAME_TO_USER_LST_TABLE[channel_name]
+
+                conexao.enviar(msg(f':{curr_usr} PART {channel_name}'))
             else:
-                return sair(conexao)
+                conexao.enviar(msg(f':server 442 {channel_name} :You are not on that channel'))
 
-            print(conexao, dado)    
-            conexao.residuais = b''
-            
-        else:
-            conexao.residuais += dado
-
-    if conexao.residuais.endswith(b'\r\n'):
-        conexao.enviar(b':server PONG server :' + conexao.residuais.replace(b'PING ', b''))
-        conexao.residuais = b''
-        
-        print(conexao, d)
-        print(conexao, dado)
 
 def conexao_aceita(conexao):
-    conexao.residuais = b''
-    conexao.apelidos = b'' 
-    conexao.apelido = b'' 
-    conexao.canal = []
-    print(conexao, 'nova conexão')
+    log(conexao, 'nova conexão')
     conexao.registrar_recebedor(dados_recebidos)
 
-canais = {}
-apelidos = {}
+
 servidor = Servidor(6667)
 servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
 asyncio.get_event_loop().run_forever()
